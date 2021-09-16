@@ -1,0 +1,350 @@
+---
+title: "Report 2"
+author: "Danny Kearns"
+date: "6/23/2020"
+output: pdf_document
+---
+
+This report will show three different ways to analyse a group of biological data and gene expression. I will demonstrate how to do this in `DESeq2`, using a random forest, and with `tidylo`, the weighted log odds ratio
+
+## DESeq2
+
+The first thing to do is read in some libraries and data. I'm once again using the `pasilla` data set
+
+```{r message=FALSE, warning=FALSE}
+library(pasilla)
+library(tidyverse)
+library(tximeta)
+library(tximportData)
+library(Rsamtools)
+library(DESeq2)
+library(magrittr)
+
+pasCts <- system.file("extdata",
+                      "pasilla_gene_counts.tsv",
+                      package="pasilla", mustWork=TRUE)
+pasAnno <- system.file("extdata",
+                       "pasilla_sample_annotation.csv",
+                       package="pasilla", mustWork=TRUE)
+cts <- as.matrix(read.csv(pasCts,sep="\t",row.names="gene_id"))
+(coldata <- read.csv(pasAnno, row.names=1))
+coldata <- coldata[,c("condition","type")]
+coldata$condition <- factor(coldata$condition)
+coldata$type <- factor(coldata$type)
+```
+
+So, I have `cts` which is a matrix that has a list of samples and `coldata` which contains a summary of the experiment. I'm only looking at `type` and `condition`, so then I will then take then names of the treatment groups and use them as my features in my count matrix. The following manipulation is being done to prepare the data for the next step. 
+
+```{r, warning=F, message=F}
+rownames(coldata) = sub("fb", "", rownames(coldata))
+cts = cts[,rownames(coldata)]
+```
+
+Using the `DESeqDataSetFromMatrix` function, I'll pass `DESeq2` my count matrix, `coldata` and a formula. Currently, I'm only going to look at how condition affects the overall gene expression, so that is what I'm making my formula in the `design` argument of the function. Going further, I only want to keep any data where the count data is GEQ 10, just to avoid unnecessary outliers
+
+```{r}
+dds = DESeqDataSetFromMatrix(countData = cts,
+                             colData = coldata,
+                             design = ~ condition)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+```
+
+Before going any further, I want to make sure the system understands that there is a difference between `treated` and `untreated` groups, so I'm going to relevel them.
+
+```{r}
+dds$condition = relevel(dds$condition, ref = "untreated")
+
+```
+
+Now, I'm going to let `DESeq2` analyse the data. The `results` function will summarise it's findings.
+
+```{r, warning=FALSE, message=FALSE}
+dds = DESeq(dds)
+(res = results(dds))
+
+```
+
+I'm only going to focus on `baseMean`, `log2FoldChange`, and `pvalue` for the time being. The `baseMean` is the average count of genes per sample, `log2FoldChagne` takes the change in expression between a treated and untreated group, and takes the $log_2$ of that. `pvalue` obviously is the p-value of the hypothesis test between treated and untreated groups.
+
+Now, one of things to notice is the `lfcSE`, the logfold change standard error. Ideally, I want to minimize standard error. There are currently a few ways to shrink the logfold change estimates. A current favorite is the `apeglm` algorithm, as developed in Zhu, Ibrahim, and Love 2018.
+
+```{r, warning=FALSE, message=FALSE}
+(resLFC = lfcShrink(dds, coef = "condition_treated_vs_untreated",
+                    type = "apeglm"))
+```
+Same counts and p-values, less standard error
+
+
+```{r}
+resOrdered = resLFC[order(res$pvalue),]
+summary(resLFC)
+```
+
+```{r}
+# How many adjusted p-values are less than 0.1?
+sum(resLFC$padj < 0.1, na.rm = T)
+
+```
+
+I'll do the same thing with the results function, eliminating anything with a p-value less than 0.95
+```{r, warning=F, message=F}
+res05 = results(dds, alpha = 0.05)
+summary(res05)
+sum(res05$padj < 0.05, na.rm = T)
+```
+
+
+`DESeq2` uses the `plotMA` function to plot log2 fold changes to a given variable over the mean of normalized counts for all samples in the data sets. In this case, the condition is going to be the cause of my log2 fold change. If the point is in blue, the adjusted p-value is less then 0.1. Any points that exceed the window parameters are plotted as open triangles, either pointing up or down
+
+```{r}
+plotMA(res, ylim = c(-2,2))
+```
+
+
+Using the MA plot with the shrink algorithm, the background noise from low counts goes away and it gives a better visual.
+```{r}
+plotMA(resLFC, ylim = c(-2,2))
+idx = identify(res$baseMean, res$log2FoldChange)
+rownames(res)[idx]
+```
+
+Of course, there are other algorithms for shrinkage to use. There's the `ashr` algorithm, discussed in Stephens, M (2016), there's also the normal shrinkage algorithm. The `normal` shrinkage algorithm can also be used
+
+```{r, warning=FALSE, message=FALSE}
+resNorm = lfcShrink(dds, coef = 2, type = "normal")
+resAsh = lfcShrink(dds, coef = 2, type = "ashr")
+```
+
+Now, to plot all of them
+
+```{r}
+par(mfrow = c(1,3), mar = c(4,4,2,1))
+xlim = c(1,1e5); ylim = c(-3,3)
+plotMA(resLFC, xlim = xlim, ylim = ylim, main = "apeglm")
+plotMA(resNorm, xlim = xlim, ylim = ylim, main = "normal")
+plotMA(resAsh, xlim = xlim, ylim = ylim, main = "ashr")
+```
+
+
+Of course, it could help to plot the counts of reads for a single gene across the groups. `plotCounts` does that. Here, I plotted the gene with the greatest changed between treated and untreated groups based on adjusted p-values.
+```{r}
+plotCounts(dds, gene = which.min(res$padj), intgroup = "condition")
+```
+This can also be done in `ggplot2`
+```{r}
+d = plotCounts(dds, gene = which.min(res$padj), intgroup = "condition",
+               returnData = T)
+ggplot(d, aes(x = condition, y = count)) +
+  geom_point(position = position_jitter(w=0.1, h = 0)) +
+  scale_y_log10(breaks = c(25,100,400))
+```
+
+# Multi-factor
+
+I can use a lot of the same steps to compare multiple features. In this case, I can also include type of analysis in my comparison of samples
+
+```{r}
+ddsMulti = dds
+levels(ddsMulti$type) = sub("-.*", "", levels(ddsMulti$type))
+levels(ddsMulti$type)
+```
+
+Just now, I'll change the `design` argument of the `DESeq` object to include both `condition` and `type`
+```{r,warning=FALSE, message=FALSE}
+design(ddsMulti) <- formula(~ type + condition)
+ddsMulti <- DESeq(ddsMulti)
+```
+
+
+
+```{r}
+resMulti = results(ddsMulti)
+head(resMulti)
+```
+So, it looks like `type` has no effect. As a follow-up, I can also analyse with just `type` considered
+
+```{r}
+resMFType <- results(ddsMulti,
+                     contrast=c("type", "single", "paired"))
+head(resMFType)
+```
+
+When testing differential expression, typically raw counts and discrete distributions are used. However, for other downstream analyses, like visualisation or clustering, transforming the count data may be beneficial. `DESeq2` already uses the log2 fold change as a means of analysis, but there are other ones to consider.
+
+In this discussion, I will consider the variance stabilizing transformation (VST), as noted in Tibshirani (1988); Huber et al. (2003); Anders and Huber (2010) and the regularized logarithm (rlog), as described in Love, Huber, and Anders (2014). These methods take log2 transformed data and normalize the data with respect to specific factors. The key of these transformations is to remove the dependence of the variance of the mean. In particular, there is a higher variance of logarithm of count data when the mean is low. They reduce the variance in comparison to experiment-wide factors. 
+
+The code to transform the data with VST and rlog is shown below. 
+```{r}
+vsd = vst(dds, blind = F)
+rld = rlog(dds, blind = F)
+```
+One thing to note is the `blind` argument of the functions. This tells the system whether or not to consider parameters of the experiment or not when doing analyses. For instance, in the case of the `pasilla` data, there are known factors in place, like `condition` that can explin the change in gene expression. In this case, it would be best to let `blind = FALSE` because I want the system to consider `condition` when estimating counts.
+
+Now, the VST stabilises the variance based on the size of the gene. The transformed data is on the log2 scale for large counts
+
+In comparison, the regularized log, takes the original count data to the log2 scale by fitting a model with a term for each sample and a prior distribution based on coefficients estimated from data. The formula is estimated as:
+
+$$log_2(q_{ij}) = \beta_{i0} + \beta_{ij}$$
+
+Here, $q_{ij}$ is a parameter proportional to the expected true concentration of frgements for gene $i$ and sample $j$, $\beta_{i0}$ is like the background noise (there's always a little bit of error that cannot be explained) and therefore does not undergo shrinkage. $\beta_{ij}$ is the sample specific coefficent which is shrunk toward zero based on the dispersion mean over the dataset. Because of its nature, `rlog` tends to have a larger effect of shrinkage. 
+
+Finally, it's time to plot these transformations. Below is code for transformed data across samples against the mean, using a shifted log transformation, the VST, and the rlog transformation. 
+
+```{r}
+ntd = normTransform(dds)
+library("vsn")
+meanSdPlot(assay(ntd))
+meanSdPlot(assay(vsd))
+meanSdPlot(assay(rld))
+```
+
+Another thing to do is to assess the quality of the data and remove bad data. I want to look in particular for samples where treatment showed abnormal results and would hurt downstream analyses. 
+
+Exploring count matrices for quality is best viewed as a heatmap. Below are heatmaps for the regular count matrix, the VST transformed count matrix, and the rlog transformed count matrix
+
+```{r}
+library(pheatmap)
+select = order(rowMeans(counts(dds, normalized = T)),
+               decreasing = T)[1:20]
+df = as.data.frame(colData(dds)[,c("condition", "type")])
+pheatmap(assay(ntd)[select,], cluster_rows = F, show_rownames = F,
+         cluster_cols = F, annotation_col = df)
+pheatmap(assay(vsd)[select,], cluster_rows = F, show_rownames = F,
+         cluster_cols = F, annotation_col = df)
+pheatmap(assay(rld)[select,], cluster_rows = F, show_rownames = F,
+         cluster_cols = F, annotation_col = df)
+```
+
+# Sample to sample distances
+
+Another use of the transformed data is sample clustering. I can apply the `dist` function to the transpose of my transformed data to get distances between samples 
+
+```{r}
+(sampleDists = dist(t(assay(vsd))))
+```
+
+Then I can make a heatmap of the distances between samples. 
+
+```{r}
+library(RColorBrewer)
+sampleDistMatrix = as.matrix(sampleDists)
+rownames(sampleDistMatrix) = paste(vsd$condition, vsd$type, sep = "-")
+colnames(sampleDistMatrix) = NULL
+colors = colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+
+Related to the distance matrix is the PCA plot. This is useful for visualising the overall effect of experiment parameters.
+
+```{r}
+plotPCA(vsd, intgroup = c("condition", "type"))
+
+# Using ggplot
+pcaData = plotPCA(vsd, intgroup = c("condition", "type"), returnData=T)
+percentVar = round(100*attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color = condition, shape = type)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ", percentVar[1],"% variance")) +
+  ylab(paste0("PC1: ", percentVar[1],"% variance")) +
+  coord_fixed()
+```
+
+There's a wealth of even more information about `DESeq2`, but I think this is a good stopping place
+
+## Random Forest
+
+The second test I'm using is the random forest. What I've found in my research is that this works a lot better as a selection algorithm of factors after running the results. I can take the average count of each gene, and build the random forest based on which treatment group gives the greatest change in expression. First thing I need to do is sort of clean up the data. I want to match up my original genes with there respective `baseMean` from the running the `DESeq` function. I converted everything to a tibble as it's a little bit easier to work with. Anywhere where the system didn't come up with a `baseMean` for a gene, I'm going to toss that out.
+
+```{r, message=FALSE, warning=FALSE}
+library(rsample)
+library(randomForest)
+library(randomForestExplainer)
+
+RF = merge(cts, resMulti, by = "row.names", all.x = TRUE)
+RF = as_tibble(RF)
+(RF %<>% filter(!is.na(baseMean)) %>% 
+                  dplyr::select(`Row.names`, 
+                  untreated1, untreated2, untreated3, untreated4,
+treated1, treated2, treated3, 
+baseMean))
+```
+
+
+I'll then take the counts for the respective treatment groups and build my random forest based on regression parameters. I'll then plot the amount of variance over the progression of the number of trees made.
+
+```{r}
+set.seed(5391)
+(forest = randomForest(baseMean ~., data = RF))
+plot(forest)
+```
+
+I will admit, this one is still a work in progress, I'm still thinking about which data from the set I should use to build the data. In addition, the parameter of `baseMean` being estimated by the treatment groups may not be the best way of going about it.
+
+
+## Weighted Logged Odds
+
+The first thing I did was to read the data into the system. I have a count matrix and a file with the annotations for the data.
+
+```{r, warning=FALSE, message=FALSE}
+library("pasilla")
+library(tidyverse)
+library(tidylo)
+library(tidytuesdayR)
+library(tidytext)
+
+pasCTS = system.file("extdata", 
+                     "pasilla_gene_counts.tsv",
+                     package = "pasilla", mustWork = TRUE)
+
+pasAnno = system.file("extdata",
+                      "pasilla_sample_annotation.csv",
+                      package = "pasilla", mustWork = TRUE)
+
+```
+
+I'm going to read my count matrix as a data frame and then take a look at the data
+
+```{r}
+cts = as.data.frame(read.csv(pasCTS, sep = "\t"))
+head(cts, 4)
+```
+
+I'll now use the principles of tidy data to arrange the data properly
+
+```{r}
+cts2 = cts%>%pivot_longer(untreated1:treated3, names_to = "condition", values_to = "counts")
+head(cts2, 10)
+```
+
+Now, apply the weighted log odds from the `tidylo` package. Now, the vignette tells me to use the count function to count the data. However, I'm already given the exon counts, so I'm going to set my $n$ to the counts column. Finally, I'll arrange the data by the greatest to least log odds ratio
+
+```{r}
+n = cts2$counts
+cts2 = cts2 %>% bind_log_odds(gene_id, condition, n)
+cts2 %>% arrange(-log_odds_weighted)
+```
+And now to visualise the data, grouping by the sample with the largest log odds ratio based on treatment group
+
+```{r, warning=FALSE, message=FALSE}
+conditions <- c("untreated1", "untreated2", "untreated3", "untreated4", 
+                "treated1", "treated2", "treated3")
+
+cts2 %>%
+  group_by(condition) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(weight = reorder_within(gene_id, log_odds_weighted, condition)) %>%
+  ggplot(aes(log_odds_weighted, weight, fill = condition)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~condition, scales = "free_y") +
+  scale_y_reordered() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL, x = "Weighted log odds (empirical Bayes)")
+```
+
+
+
